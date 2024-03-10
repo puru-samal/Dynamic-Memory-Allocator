@@ -88,25 +88,24 @@ typedef uint64_t word_t;
 /** @brief Word and header size (bytes) */
 static const size_t wsize = sizeof(word_t);
 
-/** @brief Double word size (bytes) */
+/** @brief Double word size (bytes) | Memory must be aligned to this size */
 static const size_t dsize = 2 * wsize;
 
-/** @brief Minimum block size (bytes) */
+/** @brief Minimum block size (bytes)
+ * | Since the header and footer occupy 1 wsize each (dsize total),
+ * min_block_size must be 2 * dsize to ensure alignment */
 static const size_t min_block_size = 2 * dsize;
 
-/**
- * TODO: explain what chunksize is
+/** @brief amount a heap can be extended by.
  * (Must be divisible by dsize)
  */
 static const size_t chunksize = (1 << 12);
 
-/**
- * TODO: explain what alloc_mask is
+/** @brief addr & alloc_mask gets the allocated flag
  */
 static const word_t alloc_mask = 0x1;
 
-/**
- * TODO: explain what size_mask is
+/** @brief addr & size_mask gets the size flag
  */
 static const word_t size_mask = ~(word_t)0xF;
 
@@ -135,7 +134,13 @@ typedef struct block {
      * should use a union to alias this zero-length array with another struct,
      * in order to store additional types of data in the payload memory.
      */
-    char payload[0];
+    union {
+        struct {
+            struct block *prev;
+            struct block *next;
+        } node;
+        char payload[0];
+    } un;
 
     /*
      * TODO: delete or replace this comment once you've thought about it.
@@ -145,10 +150,132 @@ typedef struct block {
      */
 } block_t;
 
+typedef struct list {
+    int size;
+    block_t *head;
+    block_t *tail;
+} List;
+
 /* Global variables */
 
 /** @brief Pointer to first block in the heap */
 static block_t *heap_start = NULL;
+
+/** @brief Heap-allocated struct containg pointers to the head and tail of the
+ * explicit free list */
+static List explicit_free_list;
+
+/**
+ * @brief Initializes a stack-allocated list
+ * @param[in] L
+ * @return
+ */
+static void init_list(List *L) {
+    dbg_assert(L != NULL);
+    L->head = NULL;
+    L->tail = NULL;
+    L->size = 0;
+}
+
+/**
+ * @brief Adds a element to the head of the list
+ * @param[in] L
+ * @param[in] b
+ * @return
+ */
+static void insert_head(List *L, block_t *b) {
+    dbg_assert(L != NULL);
+    dbg_assert(b != NULL);
+
+    if (L->size == 0) {
+        L->tail = b;
+        b->un.node.next = NULL;
+    } else {
+        b->un.node.next = L->head;
+        L->head->un.node.prev = b;
+    }
+
+    b->un.node.prev = NULL;
+    L->head = b;
+    L->size++;
+}
+
+/**
+ * @brief Adds a element to the head of the list
+ * @param[in] L
+ * @param[in] b
+ * @return
+ */
+static void insert_tail(List *L, block_t *b) {
+    dbg_assert(L != NULL);
+    dbg_assert(b != NULL);
+
+    if (L->size == 0) {
+        L->head = b;
+        b->un.node.prev = NULL;
+    } else {
+        b->un.node.prev = L->tail;
+        L->tail->un.node.next = b;
+    }
+
+    L->tail = b;
+    b->un.node.next = NULL;
+    L->size++;
+}
+
+/**
+ * @brief Removes an element from the head of the list
+ * @param[in] L
+ * @return the removed element
+ */
+static block_t *remove_head(List *L) {
+    dbg_assert(L != NULL);
+    dbg_assert(L->size != 0);
+
+    block_t *b = L->head;
+
+    if (L->size == 1) {
+
+        L->head = NULL;
+        L->tail = NULL;
+
+    } else {
+
+        L->head = b->un.node.next;
+        L->head->un.node.prev = NULL;
+    }
+
+    b->un.node.next = NULL;
+    L->size--;
+    return b;
+}
+
+/**
+ * @brief Removes an element from the tail of the list
+ * @param[in] L
+ * @return  the removed element
+ */
+static block_t *remove_tail(List *L) {
+    dbg_assert(L != NULL);
+    dbg_assert(L->size != 0);
+
+    block_t *b = L->tail;
+
+    if (L->size == 1) {
+
+        L->head = NULL;
+        L->tail = NULL;
+
+    } else {
+
+        L->tail = b->un.node.prev;
+        L->tail->un.node.next = NULL;
+    }
+
+    b->un.node.prev = NULL;
+    L->size--;
+    return b;
+}
 
 /*
  *****************************************************************************
@@ -239,7 +366,7 @@ static size_t get_size(block_t *block) {
  * @return The corresponding block
  */
 static block_t *payload_to_header(void *bp) {
-    return (block_t *)((char *)bp - offsetof(block_t, payload));
+    return (block_t *)((char *)bp - offsetof(block_t, un));
 }
 
 /**
@@ -251,7 +378,7 @@ static block_t *payload_to_header(void *bp) {
  */
 static void *header_to_payload(block_t *block) {
     dbg_requires(get_size(block) != 0);
-    return (void *)(block->payload);
+    return (void *)(block->un.payload);
 }
 
 /**
@@ -264,15 +391,15 @@ static void *header_to_payload(block_t *block) {
 static word_t *header_to_footer(block_t *block) {
     dbg_requires(get_size(block) != 0 &&
                  "Called header_to_footer on the epilogue block");
-    return (word_t *)(block->payload + get_size(block) - dsize);
+    return (word_t *)(block->un.payload + get_size(block) - dsize);
 }
 
 /**
  * @brief Given a block footer, returns a pointer to the corresponding
  *        header.
- * 
+ *
  * The header is found by subtracting the block size from
- * the footer and adding back wsize. 
+ * the footer and adding back wsize.
  *
  * If the prologue is given, then the footer is return as the block.
  *
@@ -281,7 +408,7 @@ static word_t *header_to_footer(block_t *block) {
  */
 static block_t *footer_to_header(word_t *footer) {
     size_t size = extract_size(*footer);
-    if (size == 0){
+    if (size == 0) {
         return (block_t *)footer;
     }
     return (block_t *)((char *)footer + wsize - size);
@@ -348,8 +475,13 @@ static void write_epilogue(block_t *block) {
  * @param[in] alloc The allocation status of the new block
  */
 static void write_block(block_t *block, size_t size, bool alloc) {
-    dbg_requires(block != NULL);
+    dbg_requires(block != NULL && (size_t)block % dsize);
+    dbg_requires((size_t)block > (size_t)mem_heap_lo() &&
+                 (size_t)block < (size_t)mem_heap_hi());
     dbg_requires(size > 0);
+    dbg_requires(size % dsize == 0);
+    dbg_requires(size >= min_block_size);
+
     block->header = pack(size, alloc);
     word_t *footerp = header_to_footer(block);
     *footerp = pack(size, alloc);
@@ -439,7 +571,30 @@ static block_t *coalesce_block(block_t *block) {
      * at the malloc code in CS:APP and K&R, which make heavy use of macros
      * and which we no longer consider to be good style.
      */
-    return block;
+
+    block_t *prev_block = find_prev(block);
+    block_t *next_block = find_next(block);
+    bool prev_alloc = get_alloc(prev_block);
+    bool next_alloc = get_alloc(next_block);
+    size_t curr_size = get_size(block);
+
+    if (prev_alloc && next_alloc) { /* Case 1: Prev and Next are allocated */
+        return block;
+    } else if (prev_alloc && !next_alloc) /* Case 2: Next is free */
+    {
+        curr_size += get_size(next_block);
+        write_block(block, curr_size, false);
+        return block;
+    } else if (!prev_alloc && next_alloc) /* Case 3: Prev is free */
+    {
+        curr_size += get_size(prev_block);
+        write_block(prev_block, curr_size, false);
+        return prev_block;
+    } else { /* Prev and Next are free */
+        curr_size += get_size(prev_block) + get_size(next_block);
+        write_block(prev_block, curr_size, false);
+        return prev_block;
+    }
 }
 
 /**
@@ -467,6 +622,7 @@ static block_t *extend_heap(size_t size) {
      * Think about what bp represents. Why do we write the new block
      * starting one word BEFORE bp, but with the same size that we
      * originally requested?
+     * bp represents the first byte of the newly allocated heap area.
      */
 
     // Initialize free block header/footer
@@ -537,6 +693,39 @@ static block_t *find_fit(size_t asize) {
 /**
  * @brief
  *
+ * Checks a block for memory alighment
+ * and matching header-footer pairs
+ *
+ * @param[in] block
+ */
+static void check_block(block_t *block) {
+
+    /* Check address alignment */
+    if (!(size_t)block % dsize)
+        dbg_printf("Error: Bad alignment at %p\n", (void *)block);
+
+    /* Check within heap boundaries */
+    if (!((size_t)block > (size_t)mem_heap_lo() &&
+          (size_t)block < (size_t)mem_heap_hi()))
+        dbg_printf("Error: Block %p not within heap bounds\n", (void *)block);
+
+    /* Check minimum size of block */
+    if (get_size(block) < min_block_size)
+        dbg_printf("Error: Less than minimum size at %p\n", (void *)block);
+
+    /* Check if header matches footer */
+    if (get_size(block) != extract_size(*header_to_footer(block)))
+        dbg_printf("Error: Footer size does not match Header %p\n",
+                   (void *)block);
+
+    if (get_alloc(block) != extract_alloc(*header_to_footer(block)))
+        dbg_printf("Error: Footer alloc does not match Header %p\n",
+                   (void *)block);
+}
+
+/**
+ * @brief
+ *
  * <What does this function do?>
  * <What are the function's arguments?>
  * <What is the function's return value?>
@@ -558,7 +747,25 @@ bool mm_checkheap(int line) {
      * Internal use only: If you mix guacamole on your bibimbap,
      * do you eat it with a pair of chopsticks, or with a spoon?
      */
-    dbg_printf("I did not write a heap checker (called at line %d)\n", line);
+
+    // Check Prologue
+    block_t *prologue = find_prev(heap_start);
+
+    if (get_size(prologue) != 0 || !get_alloc(prologue))
+        dbg_printf("Error: Bad Prologue\n");
+
+    block_t *block;
+
+    // Traverse the Blocks
+    for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
+
+        check_block(block);
+    }
+
+    block_t *epilogue = block;
+    if (get_size(epilogue) != 0 || !get_alloc(epilogue))
+        dbg_printf("Error: Bad Epilogue\n");
+
     return true;
 }
 
@@ -591,6 +798,9 @@ bool mm_init(void) {
 
     // Heap starts with first "block header", currently the epilogue
     heap_start = (block_t *)&(start[1]);
+
+    // Initialize Explicit Free List
+    init_list(&explicit_free_list);
 
     // Extend the empty heap with a free block of chunksize bytes
     if (extend_heap(chunksize) == NULL) {
