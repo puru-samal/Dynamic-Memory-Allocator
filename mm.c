@@ -150,132 +150,13 @@ typedef struct block {
      */
 } block_t;
 
-typedef struct list {
-    int size;
-    block_t *head;
-    block_t *tail;
-} List;
-
 /* Global variables */
 
 /** @brief Pointer to first block in the heap */
 static block_t *heap_start = NULL;
 
-/** @brief Heap-allocated struct containg pointers to the head and tail of the
- * explicit free list */
-static List explicit_free_list;
-
-/**
- * @brief Initializes a stack-allocated list
- * @param[in] L
- * @return
- */
-static void init_list(List *L) {
-    dbg_assert(L != NULL);
-    L->head = NULL;
-    L->tail = NULL;
-    L->size = 0;
-}
-
-/**
- * @brief Adds a element to the head of the list
- * @param[in] L
- * @param[in] b
- * @return
- */
-static void insert_head(List *L, block_t *b) {
-    dbg_assert(L != NULL);
-    dbg_assert(b != NULL);
-
-    if (L->size == 0) {
-        L->tail = b;
-        b->un.node.next = NULL;
-    } else {
-        b->un.node.next = L->head;
-        L->head->un.node.prev = b;
-    }
-
-    b->un.node.prev = NULL;
-    L->head = b;
-    L->size++;
-}
-
-/**
- * @brief Adds a element to the head of the list
- * @param[in] L
- * @param[in] b
- * @return
- */
-static void insert_tail(List *L, block_t *b) {
-    dbg_assert(L != NULL);
-    dbg_assert(b != NULL);
-
-    if (L->size == 0) {
-        L->head = b;
-        b->un.node.prev = NULL;
-    } else {
-        b->un.node.prev = L->tail;
-        L->tail->un.node.next = b;
-    }
-
-    L->tail = b;
-    b->un.node.next = NULL;
-    L->size++;
-}
-
-/**
- * @brief Removes an element from the head of the list
- * @param[in] L
- * @return the removed element
- */
-static block_t *remove_head(List *L) {
-    dbg_assert(L != NULL);
-    dbg_assert(L->size != 0);
-
-    block_t *b = L->head;
-
-    if (L->size == 1) {
-
-        L->head = NULL;
-        L->tail = NULL;
-
-    } else {
-
-        L->head = b->un.node.next;
-        L->head->un.node.prev = NULL;
-    }
-
-    b->un.node.next = NULL;
-    L->size--;
-    return b;
-}
-
-/**
- * @brief Removes an element from the tail of the list
- * @param[in] L
- * @return  the removed element
- */
-static block_t *remove_tail(List *L) {
-    dbg_assert(L != NULL);
-    dbg_assert(L->size != 0);
-
-    block_t *b = L->tail;
-
-    if (L->size == 1) {
-
-        L->head = NULL;
-        L->tail = NULL;
-
-    } else {
-
-        L->tail = b->un.node.prev;
-        L->tail->un.node.next = NULL;
-    }
-
-    b->un.node.prev = NULL;
-    L->size--;
-    return b;
-}
+/** @brief Pointer to the head of the explicit_free_list */
+static block_t *explicit_free_list = NULL;
 
 /*
  *****************************************************************************
@@ -543,6 +424,150 @@ static block_t *find_prev(block_t *block) {
 
 /******** The remaining content below are helper and debug routines ********/
 
+/*
+ * ---------------------------------------------------------------------------
+ *                        BEGIN EXPLICIT-FREE-LIST FUNCTIONS
+ * ---------------------------------------------------------------------------
+ */
+
+static bool is_in(block_t **head, block_t *b) {
+    for (block_t *tmp = (*head); tmp != NULL; tmp = tmp->un.node.next) {
+        if (tmp == b)
+            return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Adds a element to the head of the list
+ * @param[in] head
+ * @param[in] b
+ * @return
+ */
+static void insert_head(block_t **head, block_t *b) {
+    dbg_requires(head != NULL);
+    dbg_requires(b != NULL);
+    dbg_requires(!get_alloc(b));
+    dbg_requires(!is_in(head, b));
+
+    if ((*head) == NULL) {
+        (*head) = b;
+        b->un.node.next = NULL;
+        b->un.node.prev = NULL;
+    } else {
+        (*head)->un.node.prev = b;
+        b->un.node.next = (*head);
+        b->un.node.prev = NULL;
+        (*head) = b;
+    }
+
+    dbg_ensures(is_in(head, b));
+}
+
+/**
+ * @brief Removes an element from the head of the list
+ * @param[in] head
+ * @return the removed element
+ */
+static block_t *remove_head(block_t **head) {
+    dbg_requires(head != NULL);
+    dbg_requires(*head != NULL);
+
+    block_t *b = (*head);
+
+    if ((*head)->un.node.next == NULL) {
+        (*head) = NULL;
+    } else {
+        (*head) = (*head)->un.node.next;
+        (*head)->un.node.prev = NULL;
+    }
+    b->un.node.next = NULL;
+
+    dbg_ensures(!is_in(head, b));
+    return b;
+}
+
+/**
+ * @brief Splices out an element the list
+ * Also, sets the prev and next pointers
+ * which are used to splice in a free block
+ * to the position that was previously occupied
+ * by b.
+ * @param[in] head
+ * @param[in] b - block to splice out
+ * @param[in] prev - sets this to what b->prev points to
+ * @param[in] next - sets this to what b->next points to
+ * @return the removed element
+ */
+static void remove_block(block_t **head, block_t *b, block_t **prev,
+                         block_t **next) {
+    dbg_requires(head != NULL);
+    dbg_requires(*head != NULL);
+    dbg_requires(b != NULL);
+    dbg_requires(is_in(head, b));
+
+    if ((*head) == b) {
+        (*next) = b->un.node.next;
+        (*prev) = NULL;
+        remove_head(head);
+    } else {
+        (*next) = b->un.node.next;
+        (*prev) = b->un.node.prev;
+
+        if ((*prev) == NULL && (*next) == NULL)
+            return;
+
+        if ((*prev) != NULL) {
+            (*prev)->un.node.next = (*next);
+        }
+        if ((*next) != NULL) {
+            (*next)->un.node.prev = (*prev);
+        }
+    }
+
+    b->un.node.prev = NULL;
+    b->un.node.next = NULL;
+    dbg_ensures(!is_in(head, b));
+}
+
+/**
+ * @brief Splices in an element to the list
+ * right between prev and next.
+ * @param[in] head
+ * @param[in] b - block to splice out
+ * @param[in] prev - sets this to what b->prev points to
+ * @param[in] next - sets this to what b->next points to
+ * @return the removed element
+ */
+static void insert_block(block_t **head, block_t *new_b, block_t **prev,
+                         block_t **next) {
+    dbg_assert(head != NULL);
+    dbg_assert(new_b != NULL);
+    dbg_requires(!is_in(head, new_b));
+
+    if ((*prev) == NULL) {
+        insert_head(head, new_b);
+    } else {
+
+        (*prev)->un.node.next = new_b;
+        new_b->un.node.prev = (*prev);
+
+        if ((*next) != NULL) {
+            (*next)->un.node.prev = new_b;
+            new_b->un.node.next = (*next);
+        }
+    }
+
+    dbg_ensures(is_in(head, new_b));
+    dbg_ensures(!(next == NULL && prev == NULL));
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ *                        END EXPLICIT-FREE-LIST HELPER FUNCTIONS
+ * ---------------------------------------------------------------------------
+ */
+
 /**
  * @brief
  *
@@ -555,22 +580,7 @@ static block_t *find_prev(block_t *block) {
  * @return
  */
 static block_t *coalesce_block(block_t *block) {
-    /*
-     * TODO: delete or replace this comment once you're done.
-     *
-     * Before you start, it will be helpful to review the "Dynamic Memory
-     * Allocation: Basic" lecture, and especially the four coalescing
-     * cases that are described.
-     *
-     * The actual content of the function will probably involve a call to
-     * find_prev(), and multiple calls to write_block(). For examples of how
-     * to use write_block(), take a look at split_block().
-     *
-     * Please do not reference code from prior semesters for this, including
-     * old versions of the 213 website. We also discourage you from looking
-     * at the malloc code in CS:APP and K&R, which make heavy use of macros
-     * and which we no longer consider to be good style.
-     */
+    dbg_requires(block != NULL);
 
     block_t *prev_block = find_prev(block);
     block_t *next_block = find_next(block);
@@ -578,21 +588,37 @@ static block_t *coalesce_block(block_t *block) {
     bool next_alloc = get_alloc(next_block);
     size_t curr_size = get_size(block);
 
+    block_t *prev;
+    block_t *next;
+
     if (prev_alloc && next_alloc) { /* Case 1: Prev and Next are allocated */
+        insert_head(&explicit_free_list, block);
         return block;
     } else if (prev_alloc && !next_alloc) /* Case 2: Next is free */
     {
+        /// @NEW: Splice out Adjacent block
+
+        remove_block(&explicit_free_list, next_block, &prev, &next);
         curr_size += get_size(next_block);
         write_block(block, curr_size, false);
+        insert_head(&explicit_free_list, block);
         return block;
     } else if (!prev_alloc && next_alloc) /* Case 3: Prev is free */
     {
+        /// @NEW: Splice out prev block
+        remove_block(&explicit_free_list, prev_block, &prev, &next);
         curr_size += get_size(prev_block);
         write_block(prev_block, curr_size, false);
+        insert_head(&explicit_free_list, prev_block);
         return prev_block;
-    } else { /* Prev and Next are free */
+    } else /* Prev and Next are free */
+    {
+        /// @NEW: Splice out prev-next blocks
+        remove_block(&explicit_free_list, prev_block, &prev, &next);
+        remove_block(&explicit_free_list, next_block, &prev, &next);
         curr_size += get_size(prev_block) + get_size(next_block);
         write_block(prev_block, curr_size, false);
+        insert_head(&explicit_free_list, prev_block);
         return prev_block;
     }
 }
@@ -634,6 +660,8 @@ static block_t *extend_heap(size_t size) {
     write_epilogue(block_next);
 
     // Coalesce in case the previous block was free
+    /// @DONE: This takes care of adding the free block to the
+    /// explicit-free-list
     block = coalesce_block(block);
 
     return block;
@@ -653,17 +681,22 @@ static block_t *extend_heap(size_t size) {
 static void split_block(block_t *block, size_t asize) {
     dbg_requires(get_alloc(block));
     /* TODO: Can you write a precondition about the value of asize? */
+    dbg_requires(asize <= get_size(block));
 
     size_t block_size = get_size(block);
+
+    block_t *prev = NULL;
+    block_t *next = NULL;
+
+    remove_block(&explicit_free_list, block, &prev, &next);
 
     if ((block_size - asize) >= min_block_size) {
         block_t *block_next;
         write_block(block, asize, true);
-
         block_next = find_next(block);
         write_block(block_next, block_size - asize, false);
+        insert_head(&explicit_free_list, block_next);
     }
-
     dbg_ensures(get_alloc(block));
 }
 
@@ -679,15 +712,27 @@ static void split_block(block_t *block, size_t asize) {
  * @return
  */
 static block_t *find_fit(size_t asize) {
-    block_t *block;
 
-    for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
-
-        if (!(get_alloc(block)) && (asize <= get_size(block))) {
+    for (block_t *block = explicit_free_list; block != NULL;
+         block = block->un.node.next) {
+        if (asize <= get_size(block))
             return block;
-        }
     }
-    return NULL; // no fit found
+    return NULL; // No fit found
+}
+
+static void print_list() {
+    printf("| HEAD |\n");
+    size_t nblocks = 0;
+    size_t tsize = 0;
+    for (block_t *block = explicit_free_list; block != NULL;
+         block = block->un.node.next) {
+        printf("|i : %zu, alloc: %d, size: %zu |\n", nblocks, get_alloc(block),
+               get_size(block));
+        nblocks++;
+        tsize += get_size(block);
+    }
+    printf("|nblocks: %zu, tsize: %zu|\n", nblocks, tsize);
 }
 
 /**
@@ -698,29 +743,103 @@ static block_t *find_fit(size_t asize) {
  *
  * @param[in] block
  */
-static void check_block(block_t *block) {
+static bool check_block(block_t *block) {
 
     /* Check address alignment */
-    if (!(size_t)block % dsize)
+    if (!(size_t)block % dsize) {
         dbg_printf("Error: Bad alignment at %p\n", (void *)block);
+        return false;
+    }
 
     /* Check within heap boundaries */
     if (!((size_t)block > (size_t)mem_heap_lo() &&
-          (size_t)block < (size_t)mem_heap_hi()))
+          (size_t)block < (size_t)mem_heap_hi())) {
         dbg_printf("Error: Block %p not within heap bounds\n", (void *)block);
+        return false;
+    }
 
     /* Check minimum size of block */
-    if (get_size(block) < min_block_size)
+    if (get_size(block) < min_block_size) {
         dbg_printf("Error: Less than minimum size at %p\n", (void *)block);
+        return false;
+    }
 
     /* Check if header matches footer */
-    if (get_size(block) != extract_size(*header_to_footer(block)))
+    if (get_size(block) != extract_size(*header_to_footer(block))) {
         dbg_printf("Error: Footer size does not match Header %p\n",
                    (void *)block);
+        return false;
+    }
 
-    if (get_alloc(block) != extract_alloc(*header_to_footer(block)))
+    if (get_alloc(block) != extract_alloc(*header_to_footer(block))) {
         dbg_printf("Error: Footer alloc does not match Header %p\n",
                    (void *)block);
+        return false;
+    }
+
+    /* If block is free, check if the preceding and following blocks are
+     * allocated */
+    if (!get_alloc(block)) {
+        bool prev_alloc = get_alloc(find_prev(block));
+        bool next_alloc = get_alloc(find_next(block));
+
+        if (!prev_alloc) {
+            dbg_printf("Error: Prev block of Block %p is free'd\n",
+                       (void *)block);
+            return false;
+        }
+
+        if (!next_alloc) {
+            dbg_printf("Error: Next block of Block %p is free'd\n",
+                       (void *)block);
+            return false;
+        }
+
+        if (!prev_alloc && !next_alloc) {
+            dbg_printf("Error: Prev and Next blocks of Block %p is free'd\n",
+                       (void *)block);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief
+ *
+ * Checks list for memory alignment
+ * and matching next-prev pointers
+ *
+ * @param[in] block
+ */
+static bool check_free_list(size_t *num_blocks, size_t *total_size, int line) {
+
+    for (block_t *s = explicit_free_list; s != NULL; s = s->un.node.next) {
+        if (get_alloc(s)) {
+            dbg_printf("Error: Bad alloc, should be free && Line: %d\n", line);
+            return false;
+        }
+
+        /* Check within heap boundaries */
+        if (!(((size_t)s > (size_t)mem_heap_lo() &&
+               (size_t)s < (size_t)mem_heap_hi()))) {
+            dbg_printf("Error: Out of heap boundaries && Line: %d\n", line);
+            return false;
+        }
+
+        block_t *f = s->un.node.next;
+        if (f != NULL) {
+            if (s != f->un.node.prev) {
+                dbg_printf("Error: f->prev != s && Line: %d\n", line);
+                return false;
+            }
+        }
+        (*num_blocks)++;
+        (*total_size) += get_size(s);
+    }
+
+    return true;
 }
 
 /**
@@ -751,20 +870,45 @@ bool mm_checkheap(int line) {
     // Check Prologue
     block_t *prologue = find_prev(heap_start);
 
-    if (get_size(prologue) != 0 || !get_alloc(prologue))
-        dbg_printf("Error: Bad Prologue\n");
+    if (get_size(prologue) != 0 || !get_alloc(prologue)) {
+        dbg_printf("Error: Bad Prologue && Line: %d\n", line);
+        return false;
+    }
 
     block_t *block;
 
+    size_t num_free_blocks = 0;
+    size_t free_size = 0;
     // Traverse the Blocks
     for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
+        if (!check_block(block))
+            return false;
 
-        check_block(block);
+        if (!get_alloc(block)) {
+            num_free_blocks++;
+            free_size += get_size(block);
+        }
+    }
+
+    size_t nblocks = 0;
+    size_t tsize = 0;
+
+    if (!check_free_list(&nblocks, &free_size, line))
+        return false;
+
+    /// @todo: Verify size matches
+    if (num_free_blocks != nblocks && free_size != tsize) {
+        dbg_printf("Error: Number|Size mismatch between explicit-free-lists "
+                   "and heap && Line: %d\n",
+                   line);
+        return false;
     }
 
     block_t *epilogue = block;
-    if (get_size(epilogue) != 0 || !get_alloc(epilogue))
-        dbg_printf("Error: Bad Epilogue\n");
+    if (get_size(epilogue) != 0 || !get_alloc(epilogue)) {
+        dbg_printf("Error: Bad Epilogue && Line: %d\n", line);
+        return false;
+    }
 
     return true;
 }
@@ -800,9 +944,11 @@ bool mm_init(void) {
     heap_start = (block_t *)&(start[1]);
 
     // Initialize Explicit Free List
-    init_list(&explicit_free_list);
+    explicit_free_list = NULL;
 
     // Extend the empty heap with a free block of chunksize bytes
+    /// @DONE: Add the free block to explicit-free-list
+    /// Handled by call to coalesce within extend_heap
     if (extend_heap(chunksize) == NULL) {
         return false;
     }
@@ -847,6 +993,7 @@ void *malloc(size_t size) {
     asize = round_up(size + dsize, dsize);
 
     // Search the free list for a fit
+    /// @TODO: Search from free blocks in explicit free list
     block = find_fit(asize);
 
     // If no fit is found, request more memory, and then and place the block
@@ -866,10 +1013,9 @@ void *malloc(size_t size) {
     // Mark block as allocated
     size_t block_size = get_size(block);
     write_block(block, block_size, true);
-
     // Try to split the block if too large
+    /// @DONE: If there is a split, add the free split to explicit-free-list
     split_block(block, asize);
-
     bp = header_to_payload(block);
 
     dbg_ensures(mm_checkheap(__LINE__));
@@ -903,6 +1049,8 @@ void free(void *bp) {
     write_block(block, size, false);
 
     // Try to coalesce the block with its neighbors
+    /// @DONE: If blocks are coalesced, add the final free block to
+    /// explicit-free-list
     coalesce_block(block);
 
     dbg_ensures(mm_checkheap(__LINE__));
