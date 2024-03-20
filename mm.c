@@ -16,7 +16,7 @@
  *
  *************************************************************************
  *
- * @author Your Name <andrewid@andrew.cmu.edu>
+ * @author Puru Samal <psamal@andrew.cmu.edu>
  */
 
 #include <assert.h>
@@ -156,7 +156,8 @@ typedef struct block {
 static block_t *heap_start = NULL;
 
 /** @brief Pointer to the head of the explicit_free_list */
-static block_t *explicit_free_list = NULL;
+#define NUM_CLASSES 15
+static block_t *seg_list[NUM_CLASSES];
 
 /*
  *****************************************************************************
@@ -422,8 +423,6 @@ static block_t *find_prev(block_t *block) {
  * ---------------------------------------------------------------------------
  */
 
-/******** The remaining content below are helper and debug routines ********/
-
 /*
  * ---------------------------------------------------------------------------
  *                        BEGIN EXPLICIT-FREE-LIST FUNCTIONS
@@ -568,6 +567,66 @@ static void insert_block(block_t **head, block_t *new_b, block_t **prev,
  * ---------------------------------------------------------------------------
  */
 
+static size_t get_class(size_t sz) {
+
+    size_t idx;
+
+    // Splits for minimum block size 32
+    size_t class0 = (size_t)32UL;
+    size_t class1 = (size_t)48UL;
+    size_t class2 = (size_t)80UL;
+    size_t class3 = (size_t)96UL;
+    size_t class4 = (size_t)128UL;
+    size_t class5 = (size_t)160UL;
+    size_t class6 = (size_t)208UL;
+    size_t class7 = (size_t)272UL;
+    size_t class8 = (size_t)480UL;
+    size_t class9 = (size_t)800UL;
+    size_t class10 = (size_t)1728UL;
+    size_t class11 = (size_t)3232UL;
+    size_t class12 = (size_t)5552UL;
+    size_t class13 = (size_t)18752UL;
+    size_t class14 = (size_t)7719240847168UL;
+
+    if (sz >= class0 && sz < class1) {
+        idx = 0;
+    } else if (sz >= class1 && sz < class2) {
+        idx = 1;
+    } else if (sz >= class2 && sz < class3) {
+        idx = 2;
+    } else if (sz >= class3 && sz < class4) {
+        idx = 3;
+    } else if (sz >= class4 && sz < class5) {
+        idx = 4;
+    } else if (sz >= class5 && sz < class6) {
+        idx = 5;
+    } else if (sz >= class6 && sz < class7) {
+        idx = 6;
+    } else if (sz >= class7 && sz < class8) {
+        idx = 7;
+    } else if (sz >= class8 && sz < class9) {
+        idx = 8;
+    } else if (sz >= class9 && sz < class10) {
+        idx = 9;
+    } else if (sz >= class10 && sz < class11) {
+        idx = 10;
+    } else if (sz >= class11 && sz < class12) {
+        idx = 11;
+    } else if (sz >= class12 && sz < class13) {
+        idx = 12;
+    } else if (sz >= class13 && sz < class14) {
+        idx = 13;
+    } else {
+        idx = 14; // sz >= class14
+    }
+
+    return idx;
+
+    dbg_ensures(idx >= 0 && idx < NUM_CLASSES);
+}
+
+/******** The remaining content below are helper and debug routines ********/
+
 /**
  * @brief
  *
@@ -592,33 +651,51 @@ static block_t *coalesce_block(block_t *block) {
     block_t *next;
 
     if (prev_alloc && next_alloc) { /* Case 1: Prev and Next are allocated */
-        insert_head(&explicit_free_list, block);
+
+        size_t class = get_class(curr_size);
+        insert_head(&seg_list[class], block);
         return block;
+
     } else if (prev_alloc && !next_alloc) /* Case 2: Next is free */
     {
         /// @NEW: Splice out Adjacent block
+        size_t next_block_size = get_size(next_block);
+        size_t next_block_class = get_class(next_block_size);
+        remove_block(&seg_list[next_block_class], next_block, &prev, &next);
 
-        remove_block(&explicit_free_list, next_block, &prev, &next);
-        curr_size += get_size(next_block);
+        curr_size += next_block_size;
+        size_t curr_class = get_class(curr_size);
         write_block(block, curr_size, false);
-        insert_head(&explicit_free_list, block);
+        insert_head(&seg_list[curr_class], block);
         return block;
+
     } else if (!prev_alloc && next_alloc) /* Case 3: Prev is free */
     {
         /// @NEW: Splice out prev block
-        remove_block(&explicit_free_list, prev_block, &prev, &next);
-        curr_size += get_size(prev_block);
+        size_t prev_block_size = get_size(prev_block);
+        size_t prev_block_class = get_class(prev_block_size);
+        remove_block(&seg_list[prev_block_class], prev_block, &prev, &next);
+
+        curr_size += prev_block_size;
+        size_t curr_class = get_class(curr_size);
         write_block(prev_block, curr_size, false);
-        insert_head(&explicit_free_list, prev_block);
+        insert_head(&seg_list[curr_class], prev_block);
         return prev_block;
+
     } else /* Prev and Next are free */
     {
         /// @NEW: Splice out prev-next blocks
-        remove_block(&explicit_free_list, prev_block, &prev, &next);
-        remove_block(&explicit_free_list, next_block, &prev, &next);
-        curr_size += get_size(prev_block) + get_size(next_block);
+        size_t next_block_size = get_size(next_block);
+        size_t prev_block_size = get_size(prev_block);
+        size_t next_block_class = get_class(next_block_size);
+        size_t prev_block_class = get_class(prev_block_size);
+        remove_block(&seg_list[next_block_class], next_block, &prev, &next);
+        remove_block(&seg_list[prev_block_class], prev_block, &prev, &next);
+
+        curr_size += prev_block_size + next_block_size;
+        size_t curr_class = get_class(curr_size);
         write_block(prev_block, curr_size, false);
-        insert_head(&explicit_free_list, prev_block);
+        insert_head(&seg_list[curr_class], prev_block);
         return prev_block;
     }
 }
@@ -684,18 +761,22 @@ static void split_block(block_t *block, size_t asize) {
     dbg_requires(asize <= get_size(block));
 
     size_t block_size = get_size(block);
+    size_t curr_class = get_class(block_size);
 
     block_t *prev = NULL;
     block_t *next = NULL;
 
-    remove_block(&explicit_free_list, block, &prev, &next);
+    remove_block(&seg_list[curr_class], block, &prev, &next);
 
     if ((block_size - asize) >= min_block_size) {
         block_t *block_next;
         write_block(block, asize, true);
         block_next = find_next(block);
-        write_block(block_next, block_size - asize, false);
-        insert_head(&explicit_free_list, block_next);
+
+        size_t split_size = block_size - asize;
+        size_t split_class = get_class(split_size);
+        write_block(block_next, split_size, false);
+        insert_head(&seg_list[split_class], block_next);
     }
     dbg_ensures(get_alloc(block));
 }
@@ -713,19 +794,27 @@ static void split_block(block_t *block, size_t asize) {
  */
 static block_t *find_fit(size_t asize) {
 
-    for (block_t *block = explicit_free_list; block != NULL;
-         block = block->un.node.next) {
-        if (asize <= get_size(block))
-            return block;
+    size_t curr_class = get_class(asize);
+
+    for (size_t class = curr_class; class < NUM_CLASSES; class ++) {
+        /* code */
+        for (block_t *block = seg_list[class]; block != NULL;
+             block = block->un.node.next) {
+            if (asize <= get_size(block))
+                return block;
+        }
     }
+
     return NULL; // No fit found
 }
 
-static void print_list() {
+static void print_list(block_t *list_start) {
+
     printf("| HEAD |\n");
     size_t nblocks = 0;
     size_t tsize = 0;
-    for (block_t *block = explicit_free_list; block != NULL;
+
+    for (block_t *block = list_start; block != NULL;
          block = block->un.node.next) {
         printf("|i : %zu, alloc: %d, size: %zu |\n", nblocks, get_alloc(block),
                get_size(block));
@@ -813,11 +902,23 @@ static bool check_block(block_t *block) {
  *
  * @param[in] block
  */
-static bool check_free_list(size_t *num_blocks, size_t *total_size, int line) {
+static bool check_free_list(size_t class, size_t *num_blocks,
+                            size_t *total_size, int line) {
 
-    for (block_t *s = explicit_free_list; s != NULL; s = s->un.node.next) {
+    for (block_t *s = seg_list[class]; s != NULL; s = s->un.node.next) {
+
+        /* Check allocation */
         if (get_alloc(s)) {
             dbg_printf("Error: Bad alloc, should be free && Line: %d\n", line);
+            return false;
+        }
+
+        size_t curr_size = get_size(s);
+        size_t curr_class = get_class(curr_size);
+
+        /* Check class */
+        if (curr_class != class) {
+            dbg_printf("Error: Block in wrong class && Line: %d\n", line);
             return false;
         }
 
@@ -828,6 +929,7 @@ static bool check_free_list(size_t *num_blocks, size_t *total_size, int line) {
             return false;
         }
 
+        /* Check next/prev consistency */
         block_t *f = s->un.node.next;
         if (f != NULL) {
             if (s != f->un.node.prev) {
@@ -893,8 +995,10 @@ bool mm_checkheap(int line) {
     size_t nblocks = 0;
     size_t tsize = 0;
 
-    if (!check_free_list(&nblocks, &free_size, line))
-        return false;
+    for (size_t class = 0; class < NUM_CLASSES; class ++) {
+        if (!check_free_list(class, &nblocks, &free_size, line))
+            return false;
+    }
 
     /// @todo: Verify size matches
     if (num_free_blocks != nblocks && free_size != tsize) {
@@ -943,8 +1047,11 @@ bool mm_init(void) {
     // Heap starts with first "block header", currently the epilogue
     heap_start = (block_t *)&(start[1]);
 
-    // Initialize Explicit Free List
-    explicit_free_list = NULL;
+    // Initialize Seg List
+    for (size_t class = 0; class < NUM_CLASSES; class ++) {
+        /* code */
+        seg_list[class] = NULL;
+    }
 
     // Extend the empty heap with a free block of chunksize bytes
     /// @DONE: Add the free block to explicit-free-list
