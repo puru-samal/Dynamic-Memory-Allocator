@@ -105,6 +105,12 @@ static const size_t chunksize = (1 << 12);
  */
 static const word_t alloc_mask = 0x1;
 
+/** @brief addr & prev_alloc_mask gets the allocated flag of the previous block
+ */
+static const word_t prev_alloc_mask = 0x1 << 1;
+
+static const word_t prev_miniblock_mask = 0x1 << 2;
+
 /** @brief addr & size_mask gets the size flag
  */
 static const word_t size_mask = ~(word_t)0xF;
@@ -211,10 +217,13 @@ static size_t round_up(size_t size, size_t n) {
  * @param[in] alloc True if the block is allocated
  * @return The packed value
  */
-static word_t pack(size_t size, bool alloc) {
+static word_t pack(size_t size, bool alloc, bool prev_alloc) {
     word_t word = size;
     if (alloc) {
         word |= alloc_mask;
+    }
+    if (prev_alloc) {
+        word |= prev_alloc_mask;
     }
     return word;
 }
@@ -307,7 +316,7 @@ static block_t *footer_to_header(word_t *footer) {
  */
 static size_t get_payload_size(block_t *block) {
     size_t asize = get_size(block);
-    return asize - dsize;
+    return asize - wsize;
 }
 
 /**
@@ -331,6 +340,14 @@ static bool get_alloc(block_t *block) {
     return extract_alloc(block->header);
 }
 
+static bool extract_prev_alloc(word_t word) {
+    return (bool)(word & prev_alloc_mask);
+}
+
+static bool get_prev_alloc(block_t *block) {
+    return extract_prev_alloc(block->header);
+}
+
 /**
  * @brief Writes an epilogue header at the given address.
  *
@@ -341,7 +358,7 @@ static bool get_alloc(block_t *block) {
 static void write_epilogue(block_t *block) {
     dbg_requires(block != NULL);
     dbg_requires((char *)block == (char *)mem_heap_hi() - 7);
-    block->header = pack(0, true);
+    block->header = pack(0, true, false);
 }
 
 /**
@@ -356,17 +373,21 @@ static void write_epilogue(block_t *block) {
  * @param[in] size The size of the new block
  * @param[in] alloc The allocation status of the new block
  */
-static void write_block(block_t *block, size_t size, bool alloc) {
+static void write_block(block_t *block, size_t size, bool alloc,
+                        bool prev_alloc) {
     dbg_requires(block != NULL && (size_t)block % dsize);
     dbg_requires((size_t)block > (size_t)mem_heap_lo() &&
                  (size_t)block < (size_t)mem_heap_hi());
-    dbg_requires(size > 0);
+    dbg_requires(size >= 0);
     dbg_requires(size % dsize == 0);
-    dbg_requires(size >= min_block_size);
+    // dbg_requires(size >= min_block_size);
 
-    block->header = pack(size, alloc);
-    word_t *footerp = header_to_footer(block);
-    *footerp = pack(size, alloc);
+    block->header = pack(size, alloc, prev_alloc);
+
+    if (!alloc && size != 0) {
+        word_t *footerp = header_to_footer(block);
+        *footerp = pack(size, alloc, prev_alloc);
+    }
 }
 
 /**
@@ -641,9 +662,8 @@ static size_t get_class(size_t sz) {
 static block_t *coalesce_block(block_t *block) {
     dbg_requires(block != NULL);
 
-    block_t *prev_block = find_prev(block);
     block_t *next_block = find_next(block);
-    bool prev_alloc = get_alloc(prev_block);
+    bool prev_alloc = get_prev_alloc(block);
     bool next_alloc = get_alloc(next_block);
     size_t curr_size = get_size(block);
 
@@ -654,7 +674,6 @@ static block_t *coalesce_block(block_t *block) {
 
         size_t class = get_class(curr_size);
         insert_head(&seg_list[class], block);
-        return block;
 
     } else if (prev_alloc && !next_alloc) /* Case 2: Next is free */
     {
@@ -665,26 +684,31 @@ static block_t *coalesce_block(block_t *block) {
 
         curr_size += next_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(block, curr_size, false);
+        write_block(block, curr_size, false, true);
         insert_head(&seg_list[curr_class], block);
-        return block;
+
+        next_block = find_next(block);
 
     } else if (!prev_alloc && next_alloc) /* Case 3: Prev is free */
     {
         /// @NEW: Splice out prev block
+        block_t *prev_block = find_prev(block);
         size_t prev_block_size = get_size(prev_block);
         size_t prev_block_class = get_class(prev_block_size);
         remove_block(&seg_list[prev_block_class], prev_block, &prev, &next);
 
         curr_size += prev_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(prev_block, curr_size, false);
+        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block));
         insert_head(&seg_list[curr_class], prev_block);
-        return prev_block;
+
+        block = prev_block;
+        next_block = find_next(block);
 
     } else /* Prev and Next are free */
     {
         /// @NEW: Splice out prev-next blocks
+        block_t *prev_block = find_prev(block);
         size_t next_block_size = get_size(next_block);
         size_t prev_block_size = get_size(prev_block);
         size_t next_block_class = get_class(next_block_size);
@@ -694,10 +718,15 @@ static block_t *coalesce_block(block_t *block) {
 
         curr_size += prev_block_size + next_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(prev_block, curr_size, false);
+        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block));
         insert_head(&seg_list[curr_class], prev_block);
-        return prev_block;
+
+        block = prev_block;
+        next_block = find_next(block);
     }
+
+    write_block(next_block, get_size(next_block), get_alloc(next_block), false);
+    return block;
 }
 
 /**
@@ -730,7 +759,7 @@ static block_t *extend_heap(size_t size) {
 
     // Initialize free block header/footer
     block_t *block = payload_to_header(bp);
-    write_block(block, size, false);
+    write_block(block, size, false, get_prev_alloc(block));
 
     // Create new epilogue header
     block_t *block_next = find_next(block);
@@ -770,13 +799,19 @@ static void split_block(block_t *block, size_t asize) {
 
     if ((block_size - asize) >= min_block_size) {
         block_t *block_next;
-        write_block(block, asize, true);
+        write_block(block, asize, true, get_prev_alloc(block));
         block_next = find_next(block);
 
         size_t split_size = block_size - asize;
         size_t split_class = get_class(split_size);
-        write_block(block_next, split_size, false);
+        write_block(block_next, split_size, false, true);
         insert_head(&seg_list[split_class], block_next);
+    } else {
+
+        // Set the next blocks prev_alloc
+        block_t *block_next = find_next(block);
+        write_block(block_next, get_size(block_next), get_alloc(block_next),
+                    true);
     }
     dbg_ensures(get_alloc(block));
 }
@@ -853,23 +888,30 @@ static bool check_block(block_t *block) {
         return false;
     }
 
-    /* Check if header matches footer */
-    if (get_size(block) != extract_size(*header_to_footer(block))) {
-        dbg_printf("Error: Footer size does not match Header %p\n",
-                   (void *)block);
-        return false;
-    }
+    if (!get_alloc(block)) { /* If free block */
 
-    if (get_alloc(block) != extract_alloc(*header_to_footer(block))) {
-        dbg_printf("Error: Footer alloc does not match Header %p\n",
-                   (void *)block);
-        return false;
+        /* Check if header matches footer */
+        if (get_size(block) != extract_size(*header_to_footer(block))) {
+            dbg_printf("Error: Footer size does not match Header %p\n",
+                       (void *)block);
+
+            dbg_printf("Footer size: %zu | Header size: %zu\n",
+                       extract_size(*header_to_footer(block)), get_size(block));
+
+            return false;
+        }
+
+        if (get_alloc(block) != extract_alloc(*header_to_footer(block))) {
+            dbg_printf("Error: Footer alloc does not match Header %p\n",
+                       (void *)block);
+            return false;
+        }
     }
 
     /* If block is free, check if the preceding and following blocks are
      * allocated */
     if (!get_alloc(block)) {
-        bool prev_alloc = get_alloc(find_prev(block));
+        bool prev_alloc = get_prev_alloc(block);
         bool next_alloc = get_alloc(find_next(block));
 
         if (!prev_alloc) {
@@ -981,10 +1023,23 @@ bool mm_checkheap(int line) {
 
     size_t num_free_blocks = 0;
     size_t free_size = 0;
+    block_t *prev_block = NULL;
+
     // Traverse the Blocks
     for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
         if (!check_block(block))
             return false;
+
+        if (prev_block != NULL) {
+            if (get_alloc(prev_block) != get_prev_alloc(block)) {
+                dbg_printf("Error: get_alloc(prev_block) != "
+                           "get_prev_alloc(block) && Line: %d\n",
+                           line);
+                return false;
+            }
+        }
+
+        prev_block = block;
 
         if (!get_alloc(block)) {
             num_free_blocks++;
@@ -1041,8 +1096,8 @@ bool mm_init(void) {
      * they correspond to a block footer and header respectively?
      */
 
-    start[0] = pack(0, true); // Heap prologue (block footer)
-    start[1] = pack(0, true); // Heap epilogue (block header)
+    start[0] = pack(0, true, true); // Heap prologue (block footer)
+    start[1] = pack(0, true, true); // Heap epilogue (block header)
 
     // Heap starts with first "block header", currently the epilogue
     heap_start = (block_t *)&(start[1]);
@@ -1097,7 +1152,9 @@ void *malloc(size_t size) {
     }
 
     // Adjust block size to include overhead and to meet alignment requirements
-    asize = round_up(size + dsize, dsize);
+    asize = round_up(size + wsize, dsize);
+    if (asize < min_block_size)
+        asize = min_block_size;
 
     // Search the free list for a fit
     /// @TODO: Search from free blocks in explicit free list
@@ -1119,7 +1176,7 @@ void *malloc(size_t size) {
 
     // Mark block as allocated
     size_t block_size = get_size(block);
-    write_block(block, block_size, true);
+    write_block(block, block_size, true, get_prev_alloc(block));
     // Try to split the block if too large
     /// @DONE: If there is a split, add the free split to explicit-free-list
     split_block(block, asize);
@@ -1153,7 +1210,7 @@ void free(void *bp) {
     dbg_assert(get_alloc(block));
 
     // Mark the block as free
-    write_block(block, size, false);
+    write_block(block, size, false, get_prev_alloc(block));
 
     // Try to coalesce the block with its neighbors
     /// @DONE: If blocks are coalesced, add the final free block to
