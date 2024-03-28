@@ -1,24 +1,75 @@
-/**
- * @file mm.c
- * @brief A 64-bit struct-based implicit free list memory allocator
- *
- * 15-213: Introduction to Computer Systems
- *
- * TODO: insert your documentation here. :)
- *
+/*************************************************************************
+ * @file mm.c                                                            *
+ * @brief A 64-bit struct-based implicit free list memory allocator      *
+ *                                                                       *
+ * 15-213: Introduction to Computer Systems                              *
+ *                                                                       *
+ *                                                                       *
+ * The dynamic memory allocator manages the 'heap' which is a collection *
+ * of various-sized blocks. All blocks are 16-byte aligned.The blocks    *
+ * are broadly divided into two categories:                              *
+ *      - Allocated blocks are marked as allocated and remain allocated  *
+ *        until they are explicitly free'd. They are structured as:      *
+ *        | HEADER || PAYLOAD |                                          *
+ *      - Free blocks are are marked are free and remain so until        *
+ *        explicitly allocated. Free blocks are further divided into two *
+ *        sub-categories depending on their size:                        *
+ *          - A mini free block is a minimum_block_size'd block          *
+ *            (16 bytes). They are structured as:                        *
+ *            | HEADER || PAYLOAD (next) |                               *
+ *            Since a header is 8 bytes, and the Payload is 8 bytes,     *
+ *            The payload is aliased to be a pointer (next) that points  *
+ *            to the next mini free block. This is used to manage a      *
+ *            singly-linked list of mini-free blocks.                    *
+ *         -  A standard free block is atleast 32 bytes and is           *
+ *            structured as follows:                                     *
+ *            | HEADER || PAYLOAD (next)(prev) || FOOTER |               *
+ *            Since, the payload is atleast 16 bytes, it is aliased to   *
+ *            hold pointers to the next and previous free blocks. This   *
+ *            is used to manage a doubly-linked list of free-blocks.     *
+ *                                                                       *
+ * Headers/footers are single word-size'd and are used to encode info    *
+ * requires for performing various operations:                           *
+ *  - 60 MSB's encode the size of the block.                             *
+ *  - LSB encodes the current allocation status of the block.            *
+ *  - 2nd LSB encodes the allocation status of the previous block.       *
+ *  - 3rd LSB tells us if the previous block is a mini-block or not.     *
+ *                                                                       *
+ *                                                                       *
+ * A broad overview of the workings of my allocator is as follows:       *
+ *      - Free block organization: Free blocks are managed as segregated *
+ *        free lists. The segregated list is an array of pointers to     *
+ *        singly/doubly linked lists that are used to manage free blocks *
+ *        belonging to different size classes. The pointer at index 0    *
+ *        points to a list of blocks that are min_block_size'd (16).     *
+ *        This is the only list that is singly-linked, Every other size  *
+ *        class is large enough to have the payload alias'd to two       *
+ *        pointers, making it possible for them to be managed as doubly  *
+ *        linked lists.                                                  *
+ *      - Placement: An approximation of the Best-fit policy is used.    *
+ *        Segregated lists are used as the initial approximator to find  *
+ *        the best fit. An attempt is made to further improve the        *
+ *        best-fit approximation by searching for the next 6 blocks that *
+ *        also satisfy the size criterion and choosing the smallest      *
+ *        possible block to reduce fragmentation. See find_fit function  *
+ *        for more information.                                          *
+ *      - Splitting: If the block size is large enough to merit a split  *
+ *        while maintaining alignment, an allocated block is split into  *
+ *        an allocated and free block. The prev_alloc and prev_mini      *
+ *        flags of the next block are set appropriately. See split_block *
+ *        function for more information.                                 *
+ *      - Coalescing: Adjacent free blocks are immediately merged to     *
+ *        combat false fragmentation. See coalecse_block function for    *
+ *        more information.                                              *
+ *                                                                       *
  *************************************************************************
- *
- * ADVICE FOR STUDENTS.
- * - Step 0: Please read the writeup!
- * - Step 1: Write your heap checker.
- * - Step 2: Write contracts / debugging assert statements.
- * - Good luck, and have fun!
- *
  *************************************************************************
  *
  * @author Puru Samal <psamal@andrew.cmu.edu>
  */
 
+#include "mm.h"
+#include "memlib.h"
 #include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -27,9 +78,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#include "memlib.h"
-#include "mm.h"
 
 /* Do not change the following! */
 
@@ -92,14 +140,14 @@ static const size_t wsize = sizeof(word_t);
 static const size_t dsize = 2 * wsize;
 
 /** @brief Minimum block size (bytes)
- * | Since the header and footer occupy 1 wsize each (dsize total),
- * min_block_size must be 2 * dsize to ensure alignment */
-static const size_t min_block_size = 2 * dsize;
+ *  Minimum possible block size is 2 * wsize. 1 word for header and atlease
+ *  one word for the payload to ensure alignment. */
+static const size_t min_block_size = dsize;
 
 /** @brief amount a heap can be extended by.
  * (Must be divisible by dsize)
  */
-static const size_t chunksize = (1 << 12);
+static const size_t chunksize = (1 << 6);
 
 /** @brief addr & alloc_mask gets the allocated flag
  */
@@ -109,7 +157,15 @@ static const word_t alloc_mask = 0x1;
  */
 static const word_t prev_alloc_mask = 0x1 << 1;
 
+/** @brief addr & prev_miniblock_mask gets the miniblock status of the previous
+ * block
+ */
 static const word_t prev_miniblock_mask = 0x1 << 2;
+
+/** @brief The manimum number of blocks to check for to improve the best-fit
+ * approximation
+ */
+static const size_t max_search = 6;
 
 /** @brief addr & size_mask gets the size flag
  */
@@ -122,38 +178,15 @@ typedef struct block {
 
     /**
      * @brief A pointer to the block payload.
-     *
-     * TODO: feel free to delete this comment once you've read it carefully.
-     * We don't know what the size of the payload will be, so we will declare
-     * it as a zero-length array, which is a GNU compiler extension. This will
-     * allow us to obtain a pointer to the start of the payload. (The similar
-     * standard-C feature of "flexible array members" won't work here because
-     * those are not allowed to be members of a union.)
-     *
-     * WARNING: A zero-length array must be the last element in a struct, so
-     * there should not be any struct fields after it. For this lab, we will
-     * allow you to include a zero-length array in a union, as long as the
-     * union is the last field in its containing struct. However, this is
-     * compiler-specific behavior and should be avoided in general.
-     *
-     * WARNING: DO NOT cast this pointer to/from other types! Instead, you
-     * should use a union to alias this zero-length array with another struct,
-     * in order to store additional types of data in the payload memory.
      */
     union {
         struct {
-            struct block *prev;
             struct block *next;
+            struct block *prev;
         } node;
         char payload[0];
     } un;
 
-    /*
-     * TODO: delete or replace this comment once you've thought about it.
-     * Why can't we declare the block footer here as part of the struct?
-     * Why do we even have footers -- will the code work fine without them?
-     * which functions actually use the data contained in footers?
-     */
 } block_t;
 
 /* Global variables */
@@ -161,21 +194,16 @@ typedef struct block {
 /** @brief Pointer to first block in the heap */
 static block_t *heap_start = NULL;
 
-/** @brief Pointer to the head of the explicit_free_list */
 #define NUM_CLASSES 15
+
+/** @brief Array of pointers to the head of the explicit_free_lists segregated
+ * into diffrent classes */
 static block_t *seg_list[NUM_CLASSES];
 
 /*
  *****************************************************************************
  * The functions below are short wrapper functions to perform                *
  * bit manipulation, pointer arithmetic, and other helper operations.        *
- *                                                                           *
- * We've given you the function header comments for the functions below      *
- * to help you understand how this baseline code works.                      *
- *                                                                           *
- * Note that these function header comments are short since the functions    *
- * they are describing are short as well; you will need to provide           *
- * adequate details for the functions that you write yourself!               *
  *****************************************************************************
  */
 
@@ -217,13 +245,17 @@ static size_t round_up(size_t size, size_t n) {
  * @param[in] alloc True if the block is allocated
  * @return The packed value
  */
-static word_t pack(size_t size, bool alloc, bool prev_alloc) {
+static word_t pack(size_t size, bool alloc, bool prev_alloc,
+                   bool prev_miniblock) {
     word_t word = size;
     if (alloc) {
         word |= alloc_mask;
     }
     if (prev_alloc) {
         word |= prev_alloc_mask;
+    }
+    if (prev_miniblock) {
+        word |= prev_miniblock_mask;
     }
     return word;
 }
@@ -340,12 +372,50 @@ static bool get_alloc(block_t *block) {
     return extract_alloc(block->header);
 }
 
+/**
+ * @brief Returns the previous blocks allocation status of a given the current
+ * block's header value.
+ *
+ * This is based on the 2nd lowest bit of the header value.
+ *
+ * @param[in] word
+ * @return The previous blocks allocation status correpsonding to the word
+ */
 static bool extract_prev_alloc(word_t word) {
     return (bool)(word & prev_alloc_mask);
 }
 
+/**
+ * @brief Returns the allocation status of the previous block, based on the
+ * current blocks header.
+ * @param[in] block
+ * @return The allocation status of the previous block
+ */
 static bool get_prev_alloc(block_t *block) {
     return extract_prev_alloc(block->header);
+}
+
+/**
+ * @brief Returns the miniblock status of the previous block given the current
+ * block's header value.
+ *
+ * This is based on the lowest bit of the header value.
+ *
+ * @param[in] word
+ * @return The previous block's miniblock status correpsonding to the word
+ */
+static bool extract_prev_mini(word_t word) {
+    return (bool)(word & prev_miniblock_mask);
+}
+
+/**
+ * @brief Returns the miniblock status of the previous block, based on the
+ * current block's header.
+ * @param[in] block
+ * @return The miniblock status of the previous block
+ */
+static bool get_prev_mini(block_t *block) {
+    return extract_prev_mini(block->header);
 }
 
 /**
@@ -358,35 +428,38 @@ static bool get_prev_alloc(block_t *block) {
 static void write_epilogue(block_t *block) {
     dbg_requires(block != NULL);
     dbg_requires((char *)block == (char *)mem_heap_hi() - 7);
-    block->header = pack(0, true, false);
+    block->header = pack(0, true, false, false);
 }
 
 /**
  * @brief Writes a block starting at the given address.
  *
- * This function writes both a header and footer, where the location of the
- * footer is computed in relation to the header.
+ * This function writes both a header and optionally footer, where the location
+ * of the footer is computed in relation to the header. Only free blocks require
+ * a footer.
  *
- * TODO: Are there any preconditions or postconditions?
+ * @precontitions:
+ * block != Null, must be properly aligned and within head bounds
+ * size request must be non-negative and must be appropriate to maintain
+ * alignment.
  *
  * @param[out] block The location to begin writing the block header
  * @param[in] size The size of the new block
  * @param[in] alloc The allocation status of the new block
  */
 static void write_block(block_t *block, size_t size, bool alloc,
-                        bool prev_alloc) {
+                        bool prev_alloc, bool prev_mini) {
     dbg_requires(block != NULL && (size_t)block % dsize);
     dbg_requires((size_t)block > (size_t)mem_heap_lo() &&
                  (size_t)block < (size_t)mem_heap_hi());
     dbg_requires(size >= 0);
     dbg_requires(size % dsize == 0);
-    // dbg_requires(size >= min_block_size);
 
-    block->header = pack(size, alloc, prev_alloc);
+    block->header = pack(size, alloc, prev_alloc, prev_mini);
 
     if (!alloc && size != 0) {
         word_t *footerp = header_to_footer(block);
-        *footerp = pack(size, alloc, prev_alloc);
+        *footerp = pack(size, alloc, prev_alloc, prev_mini);
     }
 }
 
@@ -425,6 +498,8 @@ static word_t *find_prev_footer(block_t *block) {
  * The position of the previous block is found by reading the previous
  * block's footer to determine its size, then calculating the start of the
  * previous block based on its size.
+ * If the previous block is a miniblock, it has no footer. So, the previous
+ * block is found by simply offsetting by min_block_size from the header.
  *
  * @param[in] block A block in the heap
  * @return The previous consecutive block in the heap.
@@ -434,6 +509,10 @@ static block_t *find_prev(block_t *block) {
     dbg_requires(block != NULL);
     dbg_requires(get_size(block) != 0 &&
                  "Called find_prev on the first block in the heap");
+
+    if (get_prev_mini(block)) {
+        return (block_t *)((char *)block - min_block_size);
+    }
     word_t *footerp = find_prev_footer(block);
     return footer_to_header(footerp);
 }
@@ -445,11 +524,23 @@ static block_t *find_prev(block_t *block) {
  */
 
 /*
+ *****************************************************************************
+ * The functions below are short wrapper functions to perform                *
+ * to manage explicit lists of free blocks.                                  *
+ *****************************************************************************
+ */
+/*
  * ---------------------------------------------------------------------------
  *                        BEGIN EXPLICIT-FREE-LIST FUNCTIONS
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * @brief A helper function to check if b is in the list that (*head) points to
+ * @param[in] head a pointer to the head of an explicit-free list
+ * @param[in] b A block in the heap
+ * @return True is block is in the appropriate explicit-free list else false
+ */
 static bool is_in(block_t **head, block_t *b) {
     for (block_t *tmp = (*head); tmp != NULL; tmp = tmp->un.node.next) {
         if (tmp == b)
@@ -460,8 +551,8 @@ static bool is_in(block_t **head, block_t *b) {
 
 /**
  * @brief Adds a element to the head of the list
- * @param[in] head
- * @param[in] b
+ * @param[in] head a pointer to the head of an explicit-free list
+ * @param[in] b A block in the heap
  * @return
  */
 static void insert_head(block_t **head, block_t *b) {
@@ -469,6 +560,20 @@ static void insert_head(block_t **head, block_t *b) {
     dbg_requires(b != NULL);
     dbg_requires(!get_alloc(b));
     dbg_requires(!is_in(head, b));
+
+    /* miniblocks have no prev pointers. Must be handled sepatately */
+    if (get_size(b) == min_block_size) {
+
+        if ((*head) == NULL) {
+            (*head) = b;
+            b->un.node.next = NULL;
+        } else {
+            b->un.node.next = (*head);
+            (*head) = b;
+        }
+
+        return;
+    }
 
     if ((*head) == NULL) {
         (*head) = b;
@@ -482,18 +587,34 @@ static void insert_head(block_t **head, block_t *b) {
     }
 
     dbg_ensures(is_in(head, b));
+
+    return;
 }
 
 /**
  * @brief Removes an element from the head of the list
- * @param[in] head
- * @return the removed element
+ * @param[in] head a pointer to the head of an explicit-free list
+ * @return
  */
-static block_t *remove_head(block_t **head) {
+static void remove_head(block_t **head) {
     dbg_requires(head != NULL);
     dbg_requires(*head != NULL);
 
     block_t *b = (*head);
+
+    /* miniblocks have no prev pointers. Must be handled sepatately */
+    if (get_size(b) == min_block_size) {
+
+        if ((*head)->un.node.next == NULL) {
+            (*head) = NULL;
+        } else {
+            (*head) = (*head)->un.node.next;
+        }
+        b->un.node.next = NULL;
+
+        dbg_ensures(!is_in(head, b));
+        return;
+    }
 
     if ((*head)->un.node.next == NULL) {
         (*head) = NULL;
@@ -504,7 +625,7 @@ static block_t *remove_head(block_t **head) {
     b->un.node.next = NULL;
 
     dbg_ensures(!is_in(head, b));
-    return b;
+    return;
 }
 
 /**
@@ -515,33 +636,51 @@ static block_t *remove_head(block_t **head) {
  * by b.
  * @param[in] head
  * @param[in] b - block to splice out
- * @param[in] prev - sets this to what b->prev points to
- * @param[in] next - sets this to what b->next points to
- * @return the removed element
+ * @return
  */
-static void remove_block(block_t **head, block_t *b, block_t **prev,
-                         block_t **next) {
+static void remove_block(block_t **head, block_t *b) {
     dbg_requires(head != NULL);
     dbg_requires(*head != NULL);
     dbg_requires(b != NULL);
     dbg_requires(is_in(head, b));
 
+    /* miniblocks have no prev pointers. Must be handled sepatately */
+    if (get_size(b) == min_block_size) {
+
+        if ((*head) == b) {
+            remove_head(head);
+        } else {
+
+            block_t *pb = (*head);
+            block_t *cb = (*head)->un.node.next;
+
+            while (cb != NULL) {
+
+                if (cb == b) {
+                    pb->un.node.next = b->un.node.next;
+                    b->un.node.next = NULL;
+                }
+
+                pb = cb;
+                cb = cb->un.node.next;
+            }
+        }
+
+        return;
+    }
+
     if ((*head) == b) {
-        (*next) = b->un.node.next;
-        (*prev) = NULL;
         remove_head(head);
     } else {
-        (*next) = b->un.node.next;
-        (*prev) = b->un.node.prev;
 
-        if ((*prev) == NULL && (*next) == NULL)
+        if (b->un.node.next == NULL && b->un.node.prev == NULL)
             return;
 
-        if ((*prev) != NULL) {
-            (*prev)->un.node.next = (*next);
+        if (b->un.node.prev != NULL) {
+            b->un.node.prev->un.node.next = b->un.node.next;
         }
-        if ((*next) != NULL) {
-            (*next)->un.node.prev = (*prev);
+        if (b->un.node.next != NULL) {
+            b->un.node.next->un.node.prev = b->un.node.prev;
         }
     }
 
@@ -551,65 +690,35 @@ static void remove_block(block_t **head, block_t *b, block_t **prev,
 }
 
 /**
- * @brief Splices in an element to the list
- * right between prev and next.
- * @param[in] head
- * @param[in] b - block to splice out
- * @param[in] prev - sets this to what b->prev points to
- * @param[in] next - sets this to what b->next points to
- * @return the removed element
+ * @brief A helper function that returns an index to the appropriate free-list
+ * based on the size of the block
+ * @param[in] sz - size of the free block
+ * @return index into the array of free-list pointers corresponding to the
+ * appropriate size class
  */
-static void insert_block(block_t **head, block_t *new_b, block_t **prev,
-                         block_t **next) {
-    dbg_assert(head != NULL);
-    dbg_assert(new_b != NULL);
-    dbg_requires(!is_in(head, new_b));
-
-    if ((*prev) == NULL) {
-        insert_head(head, new_b);
-    } else {
-
-        (*prev)->un.node.next = new_b;
-        new_b->un.node.prev = (*prev);
-
-        if ((*next) != NULL) {
-            (*next)->un.node.prev = new_b;
-            new_b->un.node.next = (*next);
-        }
-    }
-
-    dbg_ensures(is_in(head, new_b));
-    dbg_ensures(!(next == NULL && prev == NULL));
-}
-
-/*
- * ---------------------------------------------------------------------------
- *                        END EXPLICIT-FREE-LIST HELPER FUNCTIONS
- * ---------------------------------------------------------------------------
- */
-
 static size_t get_class(size_t sz) {
 
     size_t idx;
 
-    // Splits for minimum block size 32
-    size_t class0 = (size_t)32UL;
-    size_t class1 = (size_t)48UL;
-    size_t class2 = (size_t)80UL;
-    size_t class3 = (size_t)96UL;
-    size_t class4 = (size_t)128UL;
-    size_t class5 = (size_t)160UL;
-    size_t class6 = (size_t)208UL;
-    size_t class7 = (size_t)272UL;
-    size_t class8 = (size_t)480UL;
-    size_t class9 = (size_t)800UL;
-    size_t class10 = (size_t)1728UL;
-    size_t class11 = (size_t)3232UL;
-    size_t class12 = (size_t)5552UL;
-    size_t class13 = (size_t)18752UL;
-    size_t class14 = (size_t)7719240847168UL;
+    // Splits for minimum block size 16
+    size_t class0 = min_block_size;
+    size_t class1 = (size_t)32UL;
+    size_t class2 = (size_t)48UL;
+    size_t class3 = (size_t)64UL;
+    size_t class4 = (size_t)80UL;
+    size_t class5 = (size_t)112UL;
+    size_t class6 = (size_t)160UL;
+    size_t class7 = (size_t)208UL;
+    size_t class8 = (size_t)272UL;
+    size_t class9 = (size_t)480UL;
+    size_t class10 = (size_t)800UL;
+    size_t class11 = (size_t)1728UL;
+    size_t class12 = (size_t)3232UL;
+    size_t class13 = (size_t)5536UL;
+    size_t class14 = (size_t)18736UL;
 
     if (sz >= class0 && sz < class1) {
+        /* The miniblock class. It is the only list that is singly-linked. */
         idx = 0;
     } else if (sz >= class1 && sz < class2) {
         idx = 1;
@@ -646,99 +755,116 @@ static size_t get_class(size_t sz) {
     dbg_ensures(idx >= 0 && idx < NUM_CLASSES);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ *                        END EXPLICIT-FREE-LIST HELPER FUNCTIONS
+ * ---------------------------------------------------------------------------
+ */
+
 /******** The remaining content below are helper and debug routines ********/
 
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * If there are any adjacent free blocks, this function merges them together.
+ * It also appropriately manages the free blocks in their respective explicit
+ * list And also sets the prev_alloc, prev_miniblock flags of the next block
+ * post merge.
+ * @preconditions: The block should not be NULL and must be marked as free.
  *
- * @param[in] block
- * @return
+ *
+ * @param[in] block a block in the heap
+ * @return The merged block
  */
 static block_t *coalesce_block(block_t *block) {
     dbg_requires(block != NULL);
+    dbg_requires(!get_alloc(block));
 
     block_t *next_block = find_next(block);
     bool prev_alloc = get_prev_alloc(block);
     bool next_alloc = get_alloc(next_block);
     size_t curr_size = get_size(block);
 
-    block_t *prev;
-    block_t *next;
-
     if (prev_alloc && next_alloc) { /* Case 1: Prev and Next are allocated */
 
+        /* Add the block to the correct class of explicit free list */
         size_t class = get_class(curr_size);
         insert_head(&seg_list[class], block);
 
     } else if (prev_alloc && !next_alloc) /* Case 2: Next is free */
     {
-        /// @NEW: Splice out Adjacent block
+        /* Splice out the next block */
         size_t next_block_size = get_size(next_block);
         size_t next_block_class = get_class(next_block_size);
-        remove_block(&seg_list[next_block_class], next_block, &prev, &next);
+        remove_block(&seg_list[next_block_class], next_block);
 
+        /* Merge the next block with the current block */
+        /* Add the current block to the correct class of explicit free list */
         curr_size += next_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(block, curr_size, false, true);
+        write_block(block, curr_size, false, true, get_prev_mini(block));
         insert_head(&seg_list[curr_class], block);
 
         next_block = find_next(block);
 
     } else if (!prev_alloc && next_alloc) /* Case 3: Prev is free */
     {
-        /// @NEW: Splice out prev block
+        /* Splice out the previous block */
         block_t *prev_block = find_prev(block);
         size_t prev_block_size = get_size(prev_block);
         size_t prev_block_class = get_class(prev_block_size);
-        remove_block(&seg_list[prev_block_class], prev_block, &prev, &next);
+        remove_block(&seg_list[prev_block_class], prev_block);
 
+        /* Merge the previous block with the current block */
+        /* Add the previous block to the correct class of explicit free list */
         curr_size += prev_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block));
+        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block),
+                    get_prev_mini(prev_block));
         insert_head(&seg_list[curr_class], prev_block);
 
         block = prev_block;
         next_block = find_next(block);
 
-    } else /* Prev and Next are free */
+    } else /* case 4: Prev and Next are free */
     {
-        /// @NEW: Splice out prev-next blocks
+        /* Splice out both the previous and next blocks */
         block_t *prev_block = find_prev(block);
         size_t next_block_size = get_size(next_block);
         size_t prev_block_size = get_size(prev_block);
         size_t next_block_class = get_class(next_block_size);
         size_t prev_block_class = get_class(prev_block_size);
-        remove_block(&seg_list[next_block_class], next_block, &prev, &next);
-        remove_block(&seg_list[prev_block_class], prev_block, &prev, &next);
+        remove_block(&seg_list[next_block_class], next_block);
+        remove_block(&seg_list[prev_block_class], prev_block);
 
+        /* Merge the previous and next blocks with the current block */
+        /* Add the previous block to the correct class of explicit free list */
         curr_size += prev_block_size + next_block_size;
         size_t curr_class = get_class(curr_size);
-        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block));
+        write_block(prev_block, curr_size, false, get_prev_alloc(prev_block),
+                    get_prev_mini(prev_block));
         insert_head(&seg_list[curr_class], prev_block);
 
         block = prev_block;
         next_block = find_next(block);
     }
 
-    write_block(next_block, get_size(next_block), get_alloc(next_block), false);
+    /* Each case appropriately finds next_block in the heap post-merge */
+    /* The prev_alloc and prev_miniblock flags of the next_block are set */
+    write_block(next_block, get_size(next_block), get_alloc(next_block), false,
+                get_size(block) == min_block_size);
     return block;
 }
 
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ *  This function extends the heap by size rounded to the dsize to maintain
+ * alignment.
  *
- * @param[in] size
- * @return
+ *
+ * @param[in] size -  size to extend head by. Is rounded to maintain alignment.
+ * @return The new free block created as a result of the heap extension
  */
 static block_t *extend_heap(size_t size) {
     void *bp;
@@ -749,25 +875,21 @@ static block_t *extend_heap(size_t size) {
         return NULL;
     }
 
-    /*
-     * TODO: delete or replace this comment once you've thought about it.
-     * Think about what bp represents. Why do we write the new block
-     * starting one word BEFORE bp, but with the same size that we
-     * originally requested?
-     * bp represents the first byte of the newly allocated heap area.
+    /* bp represents the first byte of the newly allocated heap area.
      */
 
     // Initialize free block header/footer
     block_t *block = payload_to_header(bp);
-    write_block(block, size, false, get_prev_alloc(block));
+    write_block(block, size, false, get_prev_alloc(block),
+                get_prev_mini(block));
 
     // Create new epilogue header
     block_t *block_next = find_next(block);
     write_epilogue(block_next);
 
     // Coalesce in case the previous block was free
-    /// @DONE: This takes care of adding the free block to the
-    /// explicit-free-list
+    /// This takes care of adding the free block to the
+    /// appropriate explicit-free-list
     block = coalesce_block(block);
 
     return block;
@@ -776,42 +898,57 @@ static block_t *extend_heap(size_t size) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * This function splits an allocated block into two parts if it is possible to
+ * do so. It also appropriately manages the free blocks in their respective
+ * explicit list And also sets the prev_alloc, prev_miniblock flags of the next
+ * block post split.
  *
- * @param[in] block
- * @param[in] asize
+ * @preconditions: The block should be marked as allocated asize <= the size of
+ * the block.
+ *
+ *
+ * @param[in] block a block in the heap
+ * @param[in] asize size of the allocation request
  */
 static void split_block(block_t *block, size_t asize) {
     dbg_requires(get_alloc(block));
-    /* TODO: Can you write a precondition about the value of asize? */
     dbg_requires(asize <= get_size(block));
 
+    /* Since the block is now allocated */
+    /* It is removed from it's explicit free list */
     size_t block_size = get_size(block);
     size_t curr_class = get_class(block_size);
+    remove_block(&seg_list[curr_class], block);
 
-    block_t *prev = NULL;
-    block_t *next = NULL;
+    if ((block_size - asize) >= min_block_size) { // Splitting critetion is met
 
-    remove_block(&seg_list[curr_class], block, &prev, &next);
-
-    if ((block_size - asize) >= min_block_size) {
+        /* Mark the first split as allocated */
         block_t *block_next;
-        write_block(block, asize, true, get_prev_alloc(block));
-        block_next = find_next(block);
+        write_block(block, asize, true, get_prev_alloc(block),
+                    get_prev_mini(block));
 
+        /* Mark the second split as free */
+        /* And add it to the appropriate explicit free list */
+        block_next = find_next(block);
         size_t split_size = block_size - asize;
         size_t split_class = get_class(split_size);
-        write_block(block_next, split_size, false, true);
+        write_block(block_next, split_size, false, true,
+                    asize == min_block_size);
         insert_head(&seg_list[split_class], block_next);
+
+        /* Set the prev_alloc and prev_miniblock flag of the next block
+         * post-split */
+        block_next = find_next(block_next);
+        write_block(block_next, get_size(block_next), get_alloc(block_next),
+                    false, split_size == min_block_size);
+
     } else {
 
-        // Set the next blocks prev_alloc
+        /* Splitting criterion is not met */
+        /* Set the prev_alloc and prev_miniblock flag of the next block */
         block_t *block_next = find_next(block);
         write_block(block_next, get_size(block_next), get_alloc(block_next),
-                    true);
+                    true, block_size == min_block_size);
     }
     dbg_ensures(get_alloc(block));
 }
@@ -819,53 +956,60 @@ static void split_block(block_t *block, size_t asize) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * This function aims to approximate the best-fit strategy
+ * and finds a block that best satisfies the allocation request.
  *
- * @param[in] asize
- * @return
+ * @param[in] asize - size of the allocation request
+ * @return - Block in the heap that satisfies the allocation request
  */
 static block_t *find_fit(size_t asize) {
 
+    /* Get class of the block based on the size request */
     size_t curr_class = get_class(asize);
+    block_t *better_fit = NULL;
+    size_t count = 0;
 
-    for (size_t class = curr_class; class < NUM_CLASSES; class ++) {
-        /* code */
+    /* Index into that class and begin traversing the explicit free lists */
+    /* Traverse the next class list if no fit is found in the current class */
+    for (size_t class = curr_class; class < NUM_CLASSES && !better_fit;
+         class ++) {
+
         for (block_t *block = seg_list[class]; block != NULL;
              block = block->un.node.next) {
-            if (asize <= get_size(block))
-                return block;
+
+            /* If a fit is found, look at the next max_search fits */
+            /* to see if a better bit is possible */
+            /* If there is a class change while the search is still underway */
+            /* The seaarch is terminated and the best fit found in the initial
+             * class is returned */
+
+            if (asize <= get_size(block)) {
+
+                if (better_fit == NULL) {
+                    better_fit = block;
+                } else {
+                    if (get_size(block) < get_size(better_fit))
+                        better_fit = block;
+                }
+                count++;
+            }
+
+            if (count >= max_search) {
+                return better_fit;
+            }
         }
     }
 
-    return NULL; // No fit found
-}
-
-static void print_list(block_t *list_start) {
-
-    printf("| HEAD |\n");
-    size_t nblocks = 0;
-    size_t tsize = 0;
-
-    for (block_t *block = list_start; block != NULL;
-         block = block->un.node.next) {
-        printf("|i : %zu, alloc: %d, size: %zu |\n", nblocks, get_alloc(block),
-               get_size(block));
-        nblocks++;
-        tsize += get_size(block);
-    }
-    printf("|nblocks: %zu, tsize: %zu|\n", nblocks, tsize);
+    return better_fit; /* If no fit is found, better_fit == NULL */
 }
 
 /**
  * @brief
  *
- * Checks a block for memory alighment
- * and matching header-footer pairs
+ * Helper function that checks a block for correctness.
  *
  * @param[in] block
+ * @return - True if all conditions are met, else false
  */
 static bool check_block(block_t *block) {
 
@@ -890,21 +1034,24 @@ static bool check_block(block_t *block) {
 
     if (!get_alloc(block)) { /* If free block */
 
-        /* Check if header matches footer */
-        if (get_size(block) != extract_size(*header_to_footer(block))) {
-            dbg_printf("Error: Footer size does not match Header %p\n",
-                       (void *)block);
+        if (get_size(block) != min_block_size) {
+            /* Check if header matches footer */
+            if (get_size(block) != extract_size(*header_to_footer(block))) {
+                dbg_printf("Error: Footer size does not match Header %p\n",
+                           (void *)block);
 
-            dbg_printf("Footer size: %zu | Header size: %zu\n",
-                       extract_size(*header_to_footer(block)), get_size(block));
+                dbg_printf("Footer size: %zu | Header size: %zu\n",
+                           extract_size(*header_to_footer(block)),
+                           get_size(block));
 
-            return false;
-        }
+                return false;
+            }
 
-        if (get_alloc(block) != extract_alloc(*header_to_footer(block))) {
-            dbg_printf("Error: Footer alloc does not match Header %p\n",
-                       (void *)block);
-            return false;
+            if (get_alloc(block) != extract_alloc(*header_to_footer(block))) {
+                dbg_printf("Error: Footer alloc does not match Header %p\n",
+                           (void *)block);
+                return false;
+            }
         }
     }
 
@@ -939,10 +1086,15 @@ static bool check_block(block_t *block) {
 /**
  * @brief
  *
- * Checks list for memory alignment
- * and matching next-prev pointers
+ * Helper function that checks a explicit list for correctness.
  *
- * @param[in] block
+ * @param[in] class - the class of explicit free list to traverse
+ * @param[in] num_blocks - a zero-init size_t pointer. The function updates it's
+ * value to the number of free blocks it traversed through
+ * @param[in] size - a zero-init size_t pointer. The function updates it's
+ * value to the total size of free blocks it traversed through
+ * @param[in] line - Line number where the function was called
+ * @return - True if all conditions are met, else false
  */
 static bool check_free_list(size_t class, size_t *num_blocks,
                             size_t *total_size, int line) {
@@ -971,14 +1123,18 @@ static bool check_free_list(size_t class, size_t *num_blocks,
             return false;
         }
 
-        /* Check next/prev consistency */
-        block_t *f = s->un.node.next;
-        if (f != NULL) {
-            if (s != f->un.node.prev) {
-                dbg_printf("Error: f->prev != s && Line: %d\n", line);
-                return false;
+        /* Only for the doubly-linked lists */
+        if (curr_size != min_block_size) {
+            /* Check next/prev consistency */
+            block_t *f = s->un.node.next;
+            if (f != NULL) {
+                if (s != f->un.node.prev) {
+                    dbg_printf("Error: f->prev != s && Line: %d\n", line);
+                    return false;
+                }
             }
         }
+
         (*num_blocks)++;
         (*total_size) += get_size(s);
     }
@@ -989,27 +1145,13 @@ static bool check_free_list(size_t class, size_t *num_blocks,
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * A heap consistency checker that uses the previous helper functions
+ * to ensure correctness for the heap.
  *
- * @param[in] line
- * @return
+ * @param[in] line - Line number where the function was called
+ * @return - True if all conditions are met, else false
  */
 bool mm_checkheap(int line) {
-    /*
-     * TODO: Delete this comment!
-     *
-     * You will need to write the heap checker yourself.
-     * Please keep modularity in mind when you're writing the heap checker!
-     *
-     * As a filler: one guacamole is equal to 6.02214086 x 10**23 guacas.
-     * One might even call it...  the avocado's number.
-     *
-     * Internal use only: If you mix guacamole on your bibimbap,
-     * do you eat it with a pair of chopsticks, or with a spoon?
-     */
 
     // Check Prologue
     block_t *prologue = find_prev(heap_start);
@@ -1020,42 +1162,65 @@ bool mm_checkheap(int line) {
     }
 
     block_t *block;
-
+    /* Zero-init counts for implicit list traversal */
     size_t num_free_blocks = 0;
     size_t free_size = 0;
     block_t *prev_block = NULL;
 
-    // Traverse the Blocks
+    // Traverse he implicit list of blocks
     for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
+
+        /* Check each block for correctness */
         if (!check_block(block))
             return false;
 
         if (prev_block != NULL) {
+
+            /* Check for curr_alloc, prev_alloc consistency */
             if (get_alloc(prev_block) != get_prev_alloc(block)) {
                 dbg_printf("Error: get_alloc(prev_block) != "
                            "get_prev_alloc(block) && Line: %d\n",
                            line);
                 return false;
             }
+
+            /* Check for curr_mini, prev_miniblock consistency */
+            if (get_size(prev_block) == min_block_size) {
+                if (!get_prev_mini(block)) {
+                    dbg_printf("Error: prev_mini mismatch && Line: %d\n", line);
+                    return false;
+                }
+            }
         }
 
         prev_block = block;
 
+        /* Maintain a count of the number of free blocks seen and the total size
+         */
         if (!get_alloc(block)) {
             num_free_blocks++;
             free_size += get_size(block);
         }
     }
 
+    /* Zero-init counts for segregated list traversal */
     size_t nblocks = 0;
     size_t tsize = 0;
 
+    /* Now traverse the segeragated free lists */
     for (size_t class = 0; class < NUM_CLASSES; class ++) {
+
+        /* Check if eack free list is valid */
+        /* Updates  the number of free blocks and the total size of free blocks
+         */
         if (!check_free_list(class, &nblocks, &free_size, line))
             return false;
     }
 
-    /// @todo: Verify size matches
+    /// The number of free blocks and total free size during
+    /// the implicit list traversal should be equal to the
+    /// number of free blocks and the total free size recorded
+    /// while traversing the segregated list
     if (num_free_blocks != nblocks && free_size != tsize) {
         dbg_printf("Error: Number|Size mismatch between explicit-free-lists "
                    "and heap && Line: %d\n",
@@ -1063,6 +1228,7 @@ bool mm_checkheap(int line) {
         return false;
     }
 
+    /* Check epilogue */
     block_t *epilogue = block;
     if (get_size(epilogue) != 0 || !get_alloc(epilogue)) {
         dbg_printf("Error: Bad Epilogue && Line: %d\n", line);
@@ -1075,14 +1241,12 @@ bool mm_checkheap(int line) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * Initializes the allocator, by creating a heap of chunksize bytes
  *
- * @return
+ * @return True if init is successful, false otherwise
  */
 bool mm_init(void) {
+
     // Create the initial empty heap
     word_t *start = (word_t *)(mem_sbrk(2 * wsize));
 
@@ -1090,27 +1254,18 @@ bool mm_init(void) {
         return false;
     }
 
-    /*
-     * TODO: delete or replace this comment once you've thought about it.
-     * Think about why we need a heap prologue and epilogue. Why do
-     * they correspond to a block footer and header respectively?
-     */
-
-    start[0] = pack(0, true, true); // Heap prologue (block footer)
-    start[1] = pack(0, true, true); // Heap epilogue (block header)
+    start[0] = pack(0, true, true, false); // Heap prologue (block footer)
+    start[1] = pack(0, true, true, false); // Heap epilogue (block header)
 
     // Heap starts with first "block header", currently the epilogue
     heap_start = (block_t *)&(start[1]);
 
     // Initialize Seg List
     for (size_t class = 0; class < NUM_CLASSES; class ++) {
-        /* code */
         seg_list[class] = NULL;
     }
 
     // Extend the empty heap with a free block of chunksize bytes
-    /// @DONE: Add the free block to explicit-free-list
-    /// Handled by call to coalesce within extend_heap
     if (extend_heap(chunksize) == NULL) {
         return false;
     }
@@ -1121,13 +1276,10 @@ bool mm_init(void) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * Allocates a block of atleast size bytes on the heap.
  *
- * @param[in] size
- * @return
+ * @param[in] size - size of the allocation request
+ * @return - A pointer to the payload of the allocated block
  */
 void *malloc(size_t size) {
     dbg_requires(mm_checkheap(__LINE__));
@@ -1157,7 +1309,6 @@ void *malloc(size_t size) {
         asize = min_block_size;
 
     // Search the free list for a fit
-    /// @TODO: Search from free blocks in explicit free list
     block = find_fit(asize);
 
     // If no fit is found, request more memory, and then and place the block
@@ -1176,9 +1327,10 @@ void *malloc(size_t size) {
 
     // Mark block as allocated
     size_t block_size = get_size(block);
-    write_block(block, block_size, true, get_prev_alloc(block));
+    write_block(block, block_size, true, get_prev_alloc(block),
+                get_prev_mini(block));
+
     // Try to split the block if too large
-    /// @DONE: If there is a split, add the free split to explicit-free-list
     split_block(block, asize);
     bp = header_to_payload(block);
 
@@ -1189,12 +1341,12 @@ void *malloc(size_t size) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * If ptr is NULL, does nothing. Otherwise, marks the block associated with a
+ * ptr to the beginning of a block payload returned by a previous call to
+ * malloc, calloc, or realloc as free.
  *
- * @param[in] bp
+ * @param[in] bp - pointer to the payload returned by a call to malloc, calloc
+ * or realloc
  */
 void free(void *bp) {
     dbg_requires(mm_checkheap(__LINE__));
@@ -1210,11 +1362,10 @@ void free(void *bp) {
     dbg_assert(get_alloc(block));
 
     // Mark the block as free
-    write_block(block, size, false, get_prev_alloc(block));
+    write_block(block, size, false, get_prev_alloc(block),
+                get_prev_mini(block));
 
     // Try to coalesce the block with its neighbors
-    /// @DONE: If blocks are coalesced, add the final free block to
-    /// explicit-free-list
     coalesce_block(block);
 
     dbg_ensures(mm_checkheap(__LINE__));
@@ -1223,14 +1374,16 @@ void free(void *bp) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * Changes the size of a previously allocated block.
+ * If size is nonzero and ptr is not NULL, allocates a new block with at least
+ * size bytes of payload, copies as much data from ptr into the new block as
+ * will fit frees ptr. If size is nonzero but ptr is
+ * NULL, does the same thing as malloc(size). If size is zero, does the same
+ * thing as free(ptr).
  *
  * @param[in] ptr
  * @param[in] size
- * @return
+ * @return - The new block (if size > 0) | NULL (size == 0)
  */
 void *realloc(void *ptr, size_t size) {
     block_t *block = payload_to_header(ptr);
@@ -1272,14 +1425,12 @@ void *realloc(void *ptr, size_t size) {
 /**
  * @brief
  *
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * Allocates memory for an array of elements of size bytes each, initializes the
+ * memory to all bytes zero.
  *
- * @param[in] elements
- * @param[in] size
- * @return
+ * @param[in] elements - number of elements
+ * @param[in] size - size of each element
+ * @return - Pointer to the allocated memory
  */
 void *calloc(size_t elements, size_t size) {
     void *bp;
